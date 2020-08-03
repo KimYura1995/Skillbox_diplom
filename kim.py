@@ -1,159 +1,271 @@
 # -*- coding: utf-8 -*-
-
+import random
+from abc import ABC, abstractmethod
+from math import sqrt, degrees, acos
 from astrobox.core import Drone
-from robogame_engine.geometry import Point
+from robogame_engine.geometry import Vector, Point
 from robogame_engine.theme import theme
 
-import math
+
+# Константы
+_MAX_PAYLOAD_RETURN_MOTHERSHIP = 90
+_MIN_HEALTH_WHITE_FLAG = 0.8
+_MAX_RADIUS_SEARCH = 580
+_DISTANCE_TO_SHOT = 580
+_MIN_ANGLE_ATTACK = 10
+
+
+class DataObjects:
+    """Данные об объектах карты"""
+
+    def __init__(self):
+        self._my_team = list()
+        self._my_base = None
+
+    @property
+    def my_team(self):
+        """Моя команда дронов"""
+        return [drone for drone in self._my_team if drone.is_alive]
+
+    @property
+    def my_units(self):
+        """Мои юниты (дроны, база)"""
+        team = self._my_team.copy()
+        team.append(self._my_base)
+        return [drone for drone in team if drone.is_alive]
+
+    def add_drone_in_my_team(self, drone):
+        """Добавить дрон в мою команду"""
+        self._my_team.append(drone)
+
+    def get_enemy_drones(self, unit):
+        """Получить всех вражеских дронов"""
+        return [enemy for enemy in unit.scene.drones if enemy not in self._my_team]
+
+    def get_enemy_motherships(self, unit):
+        """Получить все вражеские базы"""
+        return [base for base in unit.scene.motherships if base is not unit.my_mothership]
+
+    def get_target_for_collecting_resource(self, unit):
+        """Получить объекты с ресурсом для сбора"""
+        list_target = list()
+        asteroids = [asteroid for asteroid in unit.asteroids if not asteroid.is_empty]
+        list_target.extend(asteroids)
+        drones = [drone for drone in unit.scene.drones if drone.payload > 0 and (not drone.is_alive)]
+        list_target.extend(drones)
+        bases = [base for base in self.get_enemy_motherships(unit) if base.payload > 0 and (not base.is_alive)]
+        list_target.extend(bases)
+        return list_target
+
+
+class State(ABC):
+    """Состояние"""
+    data = DataObjects()
+    list_occupied_objects = list()
+
+    def _adding_and_removing_queue(self, unit, target=None):
+        """Добавить/удалить цель из очереди"""
+        if unit.target in self.list_occupied_objects:
+            self.list_occupied_objects.remove(unit.target)
+        if target and target not in self.data.get_enemy_motherships(unit):
+            self.list_occupied_objects.append(target)
+
+    @abstractmethod
+    def move_to_target(self, unit):
+        pass
+
+    @abstractmethod
+    def action_on_target(self, unit):
+        pass
+
+
+class CollectorState(State):
+    """Состояние Сборщик"""
+
+    def get_target_for_harvest(self, unit, turn=False):
+        """Получить цель для сбора"""
+        list_target = sorted(self.data.get_target_for_collecting_resource(unit),
+                             key=lambda x: unit.distance_to(x))
+        for target in list_target:
+            if target not in self.list_occupied_objects:
+                if turn is False:
+                    self._adding_and_removing_queue(target=target, unit=unit)
+                return target
+
+    def move_to_target(self, unit):
+        """Движение к цели"""
+        unit.target = self.get_target_for_harvest(unit)
+        if unit.payload >= _MAX_PAYLOAD_RETURN_MOTHERSHIP or unit.target is None:
+            unit.move_at(unit.my_mothership)
+        else:
+            unit.move_at(unit.target)
+
+    def action_on_target(self, unit):
+        """Действие у цели"""
+        if unit.near(unit.my_mothership):
+            target_turn = self.get_target_for_harvest(unit, turn=True)
+            if target_turn:
+                unit.turn_to(target_turn)
+            if unit.is_empty:
+                self.move_to_target(unit)
+            else:
+                unit.unload_to(unit.my_mothership)
+        else:
+            if unit.target and unit.near(unit.target):
+                unit.load_from(unit.target)
+                unit.target = self.get_target_for_harvest(unit)
+            else:
+                unit.target = self.get_target_for_harvest(unit)
+                self.move_to_target(unit)
+
+
+class WhiteFlagState(State):
+    """Состояние 'Белый флаг' (Бросить всё и вернуться на базу)"""
+
+    def move_to_target(self, unit):
+        """Движение к цели"""
+        self._adding_and_removing_queue(unit)
+        unit.move_at(unit.my_mothership)
+
+    def action_on_target(self, unit):
+        """Действие у цели"""
+        self._adding_and_removing_queue(unit)
+        unit.move_at(unit.my_mothership)
+
+
+class AttackingState(State):
+    """Агрессивное состояние (атака цели)"""
+
+    def normalize_vector(self, vector):
+        """Нормализировать вектор"""
+        len_vector = vector.module
+        return Vector(vector.x / len_vector, vector.y / len_vector)
+
+    def scalar_vector_multiplication(self, vector1, vector2):
+        """Скалярное произведение вектора"""
+        result = vector1.x * vector2.x + vector1.y * vector2.y
+        return result
+
+    def checking_the_line_of_fire(self, unit, target, point=None):
+        """Проверить, что на линии огня нет союзников"""
+        if point is None:
+            point = unit.coord
+        vec_target_self = Vector(target.coord.x - point.x, target.coord.y - point.y)
+        norm_vec_target_self = self.normalize_vector(vec_target_self)
+        for friendly in self.data.my_units:
+            if friendly is not unit:
+                if friendly.distance_to(point) <= friendly.radius * 1.5:
+                    return False
+                vec_target_friendly = Vector(target.coord.x - friendly.coord.x, target.coord.y - friendly.coord.y)
+                norm_vec_target_friendly = self.normalize_vector(vec_target_friendly)
+                scalar = self.scalar_vector_multiplication(norm_vec_target_self, norm_vec_target_friendly)
+                try:
+                    angle = degrees(acos(scalar))
+                except:
+                    return False
+                if angle < _MIN_ANGLE_ATTACK \
+                        and (friendly.distance_to(target) < point.distance_to(target)):
+                    return False
+        else:
+            return True
+
+    def search_new_place_for_attack(self, unit):
+        """Поиск нового места для атаки цели"""
+        enemy = unit.target_for_attack
+        vector_target_self = Vector(unit.coord.x - enemy.coord.x, unit.coord.y - enemy.coord.y)
+        norm_vector = self.normalize_vector(vector_target_self)
+        for dist in range(max(int(unit.distance_to(enemy)), _DISTANCE_TO_SHOT), 200, -50):
+            for angle in range(100):
+                vector_gun_range = norm_vector * dist
+                dice = random.randint(-5, 6)
+                vector_gun_range.rotate(dice * 5)
+                point_to_attack = Point(enemy.x + vector_gun_range.x, enemy.y + vector_gun_range.y)
+                if self.checking_the_line_of_fire(unit=unit, point=point_to_attack, target=unit.target_for_attack)\
+                        and (unit.radius < point_to_attack.x < theme.FIELD_WIDTH)\
+                        and (unit.radius < point_to_attack.y < theme.FIELD_HEIGHT):
+                    return point_to_attack
+
+    def attacking(self, unit):
+        """Атака или перемещение к цели"""
+        if self.checking_the_line_of_fire(unit=unit, target=unit.target_for_attack):
+            unit.turn_to(unit.target_for_attack)
+            unit.gun.shot(unit.target_for_attack)
+        else:
+            point = self.search_new_place_for_attack(unit)
+            if point:
+                unit.move_at(point)
+            else:
+                unit.all_target_empty()
+
+    def move_to_target(self, unit):
+        """Движение к цели"""
+        self.attacking(unit)
+
+    def action_on_target(self, unit):
+        """Действие у цели"""
+        self.attacking(unit)
 
 
 class KimDrone(Drone):
-    my_team = list()
-    asteroids_info = dict()
-    total_distance_empty = 0
-    total_distance_full = 0
-    total_distance_half_empty = 0
-    max_drone_capacity = 100
-    first_target = list()
+    """Дрон"""
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self):
+        super().__init__()
         self.target = None
-        self.next_target = None
-        self.half_way_target = None
+        self.target_for_attack = None
+        self._state = CollectorState()
 
-    def _get_first_asteroid(self):
-        """Генерация очереди первом пуске"""
-        if not any(KimDrone.first_target):
-            KimDrone.first_target = sorted(self.asteroids, key=lambda x: self.distance_to(x), reverse=True)
-        return KimDrone.first_target.pop()
-
-    def _update_info_asteroids(self):
-        """Обновление информацию об астероидах (очередь)"""
-        if any(KimDrone.asteroids_info):
-            for asteroid in self.asteroids:
-                aster_info = KimDrone.asteroids_info[asteroid.id]
-                aster_info["future_payload"] = asteroid.payload
-                aster_info["max_queue"] = math.ceil(asteroid.payload / KimDrone.max_drone_capacity)
+    def change_state(self):
+        """Смена состояния"""
+        if self.meter_2 <= _MIN_HEALTH_WHITE_FLAG:
+            self._state = WhiteFlagState()
+            self.target_for_attack = None
+        elif self.is_empty and self.search_for_enemies_in_radius():
+            self._state = AttackingState()
+        elif self.is_empty and self.all_target_empty():
+            self._state = AttackingState()
         else:
-            for asteroid in self.asteroids:
-                KimDrone.asteroids_info[asteroid.id] = dict(
-                    current_queue=set(),
-                    max_queue=math.ceil(asteroid.payload / KimDrone.max_drone_capacity),
-                    future_payload=asteroid.payload
-                )
-
-    def _get_my_asteroid(self, payload_trigger=False):
-        """Получение ближайшего астероида с ресурсом"""
-        if payload_trigger is True:
-            sort_asteroids = sorted(self.asteroids, key=lambda x: x.payload, reverse=True)
-        else:
-            sort_asteroids = sorted(self.asteroids, key=lambda x: self.distance_to(x))
-        for asteroid in sort_asteroids:
-            aster_info = KimDrone.asteroids_info[asteroid.id]
-            if (len(aster_info["current_queue"]) < aster_info["max_queue"]) and (aster_info["future_payload"] > 0):
-                aster_info["future_payload"] -= KimDrone.max_drone_capacity - self.payload
-                return asteroid
-
-    def _append_queue(self):
-        """Добавление в очередь на астероид"""
-        aster_info = KimDrone.asteroids_info[self.target.id]
-        if len(aster_info["current_queue"]) < aster_info["max_queue"]:
-            KimDrone.asteroids_info[self.target.id]["current_queue"].add(self.id)
-        else:
-            self.target = None
-
-    def _delete_queue(self):
-        """Удвление из очереди на астероид"""
-        for asteroid in self.asteroids:
-            if self.id in KimDrone.asteroids_info[asteroid.id]["current_queue"]:
-                KimDrone.asteroids_info[asteroid.id]["current_queue"].remove(self.id)
-
-    def _half_way_target(self):
-        """Расчет средней точки между дроном и целью"""
-        x = int((self.coord.x + self.target.x)/2)
-        y = int((self.coord.y + self.target.y)/2)
-        self.half_way_target = Point(x, y)
-        return self.half_way_target
+            self._state = CollectorState()
+            self.target_for_attack = None
 
     def on_born(self):
         """Рождение дрона"""
-        self._update_info_asteroids()
-        self.target = self._get_first_asteroid()
-        self.move_at(self.target)
-        self.my_team.append(self)
+        self._state.data.add_drone_in_my_team(self)
+        self._state.data._my_base = self.my_mothership
+        self._state.move_to_target(self)
 
     def on_stop_at_target(self, target):
         """Остановка у цели"""
-        if self.half_way_target and self.half_way_target == target:
-            if not self.target.is_empty:
-                self.move_at(self.target)
-            else:
-                # TODO - Для повышения читаемости кода, здесь нужно код ветки выделить в метод с красноречивым названием
-                self.target = self._get_my_asteroid()
-                if self.target:
-                    self.move_at(self._half_way_target())
-                else:
-                    self.move_at(self.my_mothership)
-        else:
-            super(KimDrone, self).on_stop_at_target(target)
-
-    def on_stop_at_asteroid(self, asteroid):
-        """Остановка у астероида"""
-        self._update_info_asteroids()
-        self.next_target = self._get_my_asteroid()
-        self.turn_to(self.my_mothership)
-        self.load_from(asteroid)
+        self._state.action_on_target(self)
+        self.change_state()
 
     def on_load_complete(self):
-        """Завершение загрузки"""
-        self._update_info_asteroids()
-        self._delete_queue()
-        self.target = self._get_my_asteroid()
-        if self.is_full or self.target is None:
-            self.move_at(self.my_mothership)
-        elif self.target:
-            self.move_at(self._half_way_target())
-        else:
-            self.move_at(self.my_mothership)
-
-    def on_stop_at_mothership(self, mothership):
-        """Остановка у корабля-носителя"""
-        self._update_info_asteroids()
-        self.next_target = self._get_my_asteroid()
-        if self.next_target:
-            self.turn_to(self.next_target)
-        self.unload_to(mothership)
+        """Загрузка завершена"""
+        self._state.move_to_target(self)
+        self.change_state()
 
     def on_unload_complete(self):
-        """Выгрузка завершена"""
-        self._update_info_asteroids()
-        self.target = self._get_my_asteroid(payload_trigger=True)
-        if self.target is None:
-            self.stop()
-        else:
-            self._append_queue()
-            self.move_at(self._half_way_target())
-        self.print_stat()
-
-    def move_at(self, target, speed=None):
-        """Двигаться до цели"""
-        super().move_at(target, speed)
-        if self.is_full:
-            KimDrone.total_distance_full += self.distance_to(target)
-        elif self.is_empty:
-            KimDrone.total_distance_empty += self.distance_to(target)
-        else:
-            KimDrone.total_distance_half_empty += self.distance_to(target)
+        """Разгрузка завершена"""
+        self._state.move_to_target(self)
+        self.change_state()
 
     def on_wake_up(self):
-        if self.health < theme.DRONE_MAX_SHIELD:
-            self.move_at(self.my_mothership)
+        """Проснуться"""
+        self._state.action_on_target(self)
+        self.change_state()
 
-    def print_stat(self):
-        if all(aster.is_empty for aster in self.asteroids) and all(drone.is_empty for drone in KimDrone.my_team):
-            self.logger.warning(f"Пройдено расстояние полным:{int(KimDrone.total_distance_full)}, "
-                                f"пустым:{int(KimDrone.total_distance_empty)}, "
-                                f"полупустым:{int(KimDrone.total_distance_half_empty)}")
+    def search_for_enemies_in_radius(self):
+        """Находится, ли вражеский дрон в радиусе поиска"""
+        for enemy in sorted(self._state.data.get_enemy_drones(self), key=lambda x: x.distance_to(self)):
+            if (sqrt((enemy.coord.x - self.coord.x) ** 2 + (enemy.coord.y - self.coord.y) ** 2) <= _MAX_RADIUS_SEARCH) \
+                    and enemy.is_alive:
+                self.target_for_attack = enemy
+                return True
 
-
+    def all_target_empty(self):
+        """Если нет целей для сбора, найти базу для атаки"""
+        if self._state.data.get_target_for_collecting_resource(self) is None:
+            for enemy_base in sorted(self._state.data.get_enemy_motherships(self), key=lambda x: x.distance_to(self)):
+                if enemy_base.is_alive:
+                    self.target_for_attack = enemy_base
+                    return True
